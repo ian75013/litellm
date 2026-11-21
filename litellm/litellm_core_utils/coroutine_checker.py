@@ -1,8 +1,9 @@
 # CoroutineChecker utility for checking if functions/callables are coroutines or coroutine functions
 
 import inspect
-from typing import Any
+from typing import Any, Final
 from weakref import WeakKeyDictionary
+
 from litellm.constants import (
     COROUTINE_CHECKER_MAX_SIZE_IN_MEMORY,
 )
@@ -15,7 +16,7 @@ class CoroutineChecker:
     """
 
     def __init__(self):
-        self._cache = WeakKeyDictionary()
+        self._cache: WeakKeyDictionary[object, bool] = WeakKeyDictionary()
         self._max_size = COROUTINE_CHECKER_MAX_SIZE_IN_MEMORY
 
     def is_async_callable(self, callback: Any) -> bool:
@@ -23,19 +24,20 @@ class CoroutineChecker:
         Falls back gracefully if the object cannot be weak-referenced or cached.
         2.59x speedup.
         """
+        candidate: Final[object] = callback
         # Fast path: check cache first (most common case)
         try:
-            cached = self._cache.get(callback)
+            cached: Final = self._cache.get(candidate)
             if cached is not None:
                 return cached
         except Exception:
             pass
 
         # Determine target - optimized path for common cases
-        target = callback
+        target: object = candidate
         if not inspect.isfunction(target) and not inspect.ismethod(target):
             try:
-                call_attr = getattr(target, "__call__", None)
+                call_attr: Final[object] = getattr(target, "__call__", None)  # noqa: B004  # value unwrap so iscoroutinefunction sees through functors
                 if call_attr is not None:
                     target = call_attr
             except Exception:
@@ -53,7 +55,7 @@ class CoroutineChecker:
             if len(self._cache) >= self._max_size:
                 self._cache.clear()
 
-            self._cache[callback] = result
+            self._cache[candidate] = result
         except Exception:
             pass
 
@@ -61,4 +63,4 @@ class CoroutineChecker:
 
 
 # Global instance for backward compatibility and convenience
-coroutine_checker = CoroutineChecker()
+coroutine_checker: Final = CoroutineChecker()

@@ -1,81 +1,119 @@
 # stdlib imports
-from datetime import datetime
 import re
-from typing import Optional, Literal, Any
-import yaml
-from dataclasses import dataclass
 from collections import defaultdict
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 # third party imports
 import click
 import rich
+import yaml
+from pydantic import TypeAdapter
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+
+from litellm.litellm_core_utils.core_helpers import (
+    SupportsGet,
+    as_object_list,
+    iter_items,
+    json_contains,
+    require_attributes,
+    require_get,
+    subscript,
+)
 
 # local imports
 from ... import Client
+from ._cli_context import cli_context_values
+from .auth import joined_names
+
+_DECODED_YAML: Final = TypeAdapter(object)
+
+if TYPE_CHECKING:
+    from rich.console import JustifyMethod
+
+
+class _ModelInfoColumnConfig(TypedDict):
+    """Rendering config for one column of the ``models info`` table."""
+
+    header: ReadOnly[str]
+    style: ReadOnly[str]
+    justify: NotRequired[ReadOnly["JustifyMethod"]]
+    get_value: ReadOnly[Callable[..., str]]
 
 
 @dataclass
 class ModelYamlInfo:
     model_name: str
-    model_params: dict[str, Any]
-    model_info: dict[str, Any]
+    model_params: Mapping[str, object]
+    model_info: Mapping[str, object]
     model_id: str
-    access_groups: list[str]
+    access_groups: object
     provider: str
 
     @property
     def access_groups_str(self) -> str:
-        return ", ".join(self.access_groups) if self.access_groups else ""
+        return joined_names(self.access_groups) if self.access_groups else ""
 
 
-def _get_model_info_obj_from_yaml(model: dict[str, Any]) -> ModelYamlInfo:
+def _get_model_info_obj_from_yaml(model: dict[str, Any], model_id: str) -> ModelYamlInfo:
     """Extract model info from a model dict and return as ModelYamlInfo dataclass."""
-    model_name: str = model["model_name"]
-    model_params: dict[str, Any] = model["litellm_params"]
-    model_info: dict[str, Any] = model.get("model_info", {})
-    model_id: str = model_params["model"]
-    access_groups = model_info.get("access_groups", [])
-    provider = model_id.split("/", 1)[0] if "/" in model_id else model_id
+    model_name: Final[str] = model["model_name"]
+    model_params: Final = _DECODED_YAML.validate_python(model["litellm_params"])
+    model_info: Final = _DECODED_YAML.validate_python(model.get("model_info", {}))
+    access_groups: Final = require_get(model_info).get("access_groups", [])
+    provider: Final = model_id.split("/", 1)[0] if "/" in model_id else model_id
     return ModelYamlInfo(
         model_name=model_name,
-        model_params=model_params,
-        model_info=model_info,
+        model_params=model_params,  # pyright: ignore[reportArgumentType]  # main kept the raw YAML value
+        model_info=model_info,  # pyright: ignore[reportArgumentType]  # main kept the raw YAML value
         model_id=model_id,
         access_groups=access_groups,
         provider=provider,
     )
 
 
-def format_iso_datetime_str(iso_datetime_str: Optional[str]) -> str:
+def _str_field(model: SupportsGet, key: str, default: str) -> str:
+    return str(model.get(key, default))
+
+
+class _IsoDatetimeText(Protocol):
+    def replace(self, old: str, new: str, /) -> str: ...
+
+
+def format_iso_datetime_str(iso_datetime_str: object) -> str:
     """Format an ISO format datetime string to human-readable date with minute resolution."""
     if not iso_datetime_str:
         return ""
     try:
         # Parse ISO format datetime string
-        dt = datetime.fromisoformat(iso_datetime_str.replace("Z", "+00:00"))
+        dt: Final = datetime.fromisoformat(
+            require_attributes(iso_datetime_str, _IsoDatetimeText, "replace").replace("Z", "+00:00")
+        )
         return dt.strftime("%Y-%m-%d %H:%M")
     except (TypeError, ValueError):
         return str(iso_datetime_str)
 
 
-def format_timestamp(timestamp: Optional[int]) -> str:
+def format_timestamp(timestamp: int | None) -> str:
     """Format a Unix timestamp (integer) to human-readable date with minute resolution."""
     if timestamp is None:
         return ""
     try:
-        dt = datetime.fromtimestamp(timestamp)
+        dt: Final = datetime.fromtimestamp(timestamp)
         return dt.strftime("%Y-%m-%d %H:%M")
     except (TypeError, ValueError):
         return str(timestamp)
 
 
-def format_cost_per_1k_tokens(cost: Optional[float]) -> str:
+def format_cost_per_1k_tokens(cost: float | None) -> str:
     """Format a per-token cost to cost per 1000 tokens."""
     if cost is None:
         return ""
     try:
         # Convert string to float if needed
-        cost_float = float(cost)
+        cost_float: Final = float(cost)
         # Multiply by 1000 and format to 4 decimal places
         return f"${cost_float * 1000:.4f}"
     except (TypeError, ValueError):
@@ -84,13 +122,13 @@ def format_cost_per_1k_tokens(cost: Optional[float]) -> str:
 
 def create_client(ctx: click.Context) -> Client:
     """Helper function to create a client from context."""
-    return Client(base_url=ctx.obj["base_url"], api_key=ctx.obj["api_key"])
+    context: Final = cli_context_values(ctx)
+    return Client(base_url=context["base_url"], api_key=context["api_key"])
 
 
 @click.group()
 def models() -> None:
     """Manage models on your LiteLLM proxy server"""
-    pass
 
 
 @models.command("list")
@@ -104,14 +142,14 @@ def models() -> None:
 @click.pass_context
 def list_models(ctx: click.Context, output_format: Literal["table", "json"]) -> None:
     """List all available models"""
-    client = create_client(ctx)
-    models_list = client.models.list()
-    assert isinstance(models_list, list)
+    client: Final = create_client(ctx)
+    models_list: Final = client.models.list()
+    assert as_object_list(models_list) is not None
 
     if output_format == "json":
         rich.print_json(data=models_list)
     else:  # table format
-        table = rich.table.Table(title="Available Models")
+        table: Final = rich.table.Table(title="Available Models")
 
         # Add columns based on the data structure
         table.add_column("ID", style="cyan")
@@ -120,17 +158,18 @@ def list_models(ctx: click.Context, output_format: Literal["table", "json"]) -> 
         table.add_column("Owned By", style="yellow")
 
         # Add rows
-        for model in models_list:
-            created = model.get("created")
+        for model in iter_items(models_list):
+            entry = require_get(model)
+            created = entry.get("created")
             # Convert string timestamp to integer if needed
             if isinstance(created, str) and created.isdigit():
                 created = int(created)
 
             table.add_row(
-                str(model.get("id", "")),
-                str(model.get("object", "model")),
+                _str_field(entry, "id", ""),
+                _str_field(entry, "object", "model"),
                 (format_timestamp(created) if isinstance(created, int) else format_iso_datetime_str(created)),
-                str(model.get("owned_by", "")),
+                _str_field(entry, "owned_by", ""),
             )
 
         rich.print(table)
@@ -154,11 +193,11 @@ def list_models(ctx: click.Context, output_format: Literal["table", "json"]) -> 
 def add_model(ctx: click.Context, model_name: str, param: tuple[str, ...], info: tuple[str, ...]) -> None:
     """Add a new model to the proxy"""
     # Convert parameters from key=value format to dict
-    model_params = dict(p.split("=", 1) for p in param)
-    model_info = dict(i.split("=", 1) for i in info) if info else None
+    model_params: Final = dict(p.split("=", 1) for p in param)
+    model_info: Final = dict(i.split("=", 1) for i in info) if info else None
 
-    client = create_client(ctx)
-    result = client.models.new(
+    client: Final = create_client(ctx)
+    result: Final = client.models.new(
         model_name=model_name,
         model_params=model_params,
         model_info=model_info,
@@ -171,8 +210,8 @@ def add_model(ctx: click.Context, model_name: str, param: tuple[str, ...], info:
 @click.pass_context
 def delete_model(ctx: click.Context, model_id: str) -> None:
     """Delete a model from the proxy"""
-    client = create_client(ctx)
-    result = client.models.delete(model_id=model_id)
+    client: Final = create_client(ctx)
+    result: Final = client.models.delete(model_id=model_id)
     rich.print_json(data=result)
 
 
@@ -180,13 +219,13 @@ def delete_model(ctx: click.Context, model_id: str) -> None:
 @click.option("--id", "model_id", help="ID of the model to retrieve")
 @click.option("--name", "model_name", help="Name of the model to retrieve")
 @click.pass_context
-def get_model(ctx: click.Context, model_id: Optional[str], model_name: Optional[str]) -> None:
+def get_model(ctx: click.Context, model_id: str | None, model_name: str | None) -> None:
     """Get information about a specific model"""
     if not model_id and not model_name:
         raise click.UsageError("Either --id or --name must be provided")
 
-    client = create_client(ctx)
-    result = client.models.get(model_id=model_id, model_name=model_name)
+    client: Final = create_client(ctx)
+    result: Final = client.models.get(model_id=model_id, model_name=model_name)
     rich.print_json(data=result)
 
 
@@ -207,17 +246,17 @@ def get_model(ctx: click.Context, model_id: Optional[str], model_name: Optional[
 @click.pass_context
 def get_models_info(ctx: click.Context, output_format: Literal["table", "json"], columns: str) -> None:
     """Get detailed information about all models"""
-    client = create_client(ctx)
-    models_info = client.models.info()
-    assert isinstance(models_info, list)
+    client: Final = create_client(ctx)
+    models_info: Final = client.models.info()
+    assert as_object_list(models_info) is not None
 
     if output_format == "json":
         rich.print_json(data=models_info)
     else:  # table format
-        table = rich.table.Table(title="Models Information")
+        table: Final = rich.table.Table(title="Models Information")
 
         # Define all possible columns with their configurations
-        column_configs: dict[str, dict[str, Any]] = {
+        column_configs: Final[dict[str, _ModelInfoColumnConfig]] = {
             "public_model": {
                 "header": "Public Model",
                 "style": "cyan",
@@ -263,7 +302,7 @@ def get_models_info(ctx: click.Context, output_format: Literal["table", "json"],
         }
 
         # Add requested columns
-        requested_columns = [col.strip() for col in columns.split(",")]
+        requested_columns: Final = [col.strip() for col in columns.split(",")]
         for col_name in requested_columns:
             if col_name in column_configs:
                 config = column_configs[col_name]
@@ -276,7 +315,7 @@ def get_models_info(ctx: click.Context, output_format: Literal["table", "json"],
                 click.echo(f"Warning: Unknown column '{col_name}'", err=True)
 
         # Add rows with only the requested columns
-        for model in models_info:
+        for model in iter_items(models_info):
             row_values = []
             for col_name in requested_columns:
                 if col_name in column_configs:
@@ -305,11 +344,11 @@ def get_models_info(ctx: click.Context, output_format: Literal["table", "json"],
 def update_model(ctx: click.Context, model_id: str, param: tuple[str, ...], info: tuple[str, ...]) -> None:
     """Update an existing model's configuration"""
     # Convert parameters from key=value format to dict
-    model_params = dict(p.split("=", 1) for p in param)
-    model_info = dict(i.split("=", 1) for i in info) if info else None
+    model_params: Final = dict(p.split("=", 1) for p in param)
+    model_info: Final = dict(i.split("=", 1) for i in info) if info else None
 
-    client = create_client(ctx)
-    result = client.models.update(
+    client: Final = create_client(ctx)
+    result: Final = client.models.update(
         model_id=model_id,
         model_params=model_params,
         model_info=model_info,
@@ -317,30 +356,30 @@ def update_model(ctx: click.Context, model_id: str, param: tuple[str, ...], info
     rich.print_json(data=result)
 
 
-def _filter_model(model, model_regex, access_group_regex):
-    model_name = model.get("model_name")
-    model_params = model.get("litellm_params")
-    model_info = model.get("model_info", {})
+def _filter_model(model, model_regex, access_group_regex) -> str | None:
+    model_name: Final = model.get("model_name")
+    model_params: Final = model.get("litellm_params")
+    model_info: Final = model.get("model_info", {})
     if not model_name or not model_params:
-        return False
-    model_id = model_params.get("model")
+        return None
+    model_id: Final = model_params.get("model")
     if not model_id or not isinstance(model_id, str):
-        return False
+        return None
     if model_regex and not model_regex.search(model_id):
-        return False
-    access_groups = model_info.get("access_groups", [])
+        return None
+    access_groups: Final = model_info.get("access_groups", [])
     if access_group_regex:
         if not isinstance(access_groups, list):
-            return False
+            return None
         if not any(isinstance(group, str) and access_group_regex.search(group) for group in access_groups):
-            return False
-    return True
+            return None
+    return model_id
 
 
 def _print_models_table(added_models: list[ModelYamlInfo], table_title: str):
     if not added_models:
         return
-    table = rich.table.Table(title=table_title)
+    table: Final = rich.table.Table(title=table_title)
     table.add_column("Model Name", style="cyan")
     table.add_column("Upstream Model", style="green")
     table.add_column("Access Groups", style="magenta")
@@ -350,36 +389,40 @@ def _print_models_table(added_models: list[ModelYamlInfo], table_title: str):
 
 
 def _print_summary_table(provider_counts):
-    summary_table = rich.table.Table(title="Model Import Summary")
+    summary_table: Final = rich.table.Table(title="Model Import Summary")
     summary_table.add_column("Provider", style="cyan")
     summary_table.add_column("Count", style="green")
 
     for provider, count in provider_counts.items():
         summary_table.add_row(str(provider), str(count))
 
-    total = sum(provider_counts.values())
+    total: Final = sum(provider_counts.values())
     summary_table.add_row("[bold]Total[/bold]", f"[bold]{total}[/bold]")
 
     rich.print(summary_table)
 
 
-def get_model_list_from_yaml_file(yaml_file: str) -> list[dict[str, Any]]:
+def get_model_list_from_yaml_file(yaml_file: str) -> list[dict[str, object]]:
     """Load and validate the model list from a YAML file."""
     with open(yaml_file, "r") as f:
-        data = yaml.safe_load(f)
-    if not data or "model_list" not in data:
+        data: Final = _DECODED_YAML.validate_python(yaml.safe_load(f))
+    if not data or not json_contains(data, "model_list"):
         raise click.ClickException("YAML file must contain a 'model_list' key with a list of models.")
-    model_list = data["model_list"]
+    model_list: Final = subscript(data, "model_list")
     if not isinstance(model_list, list):
         raise click.ClickException("'model_list' must be a list of model definitions.")
     return model_list
 
 
 def _get_filtered_model_list(model_list, only_models_matching_regex, only_access_groups_matching_regex):
-    """Return a list of models that pass the filter criteria."""
-    model_regex = re.compile(only_models_matching_regex) if only_models_matching_regex else None
+    """Return (model, model_id) pairs for the models that pass the filter criteria."""
+    model_regex: Final = re.compile(only_models_matching_regex) if only_models_matching_regex else None
     access_group_regex = re.compile(only_access_groups_matching_regex) if only_access_groups_matching_regex else None
-    return [model for model in model_list if _filter_model(model, model_regex, access_group_regex)]
+    return [
+        (model, model_id)
+        for model in model_list
+        if (model_id := _filter_model(model, model_regex, access_group_regex)) is not None
+    ]
 
 
 def _import_models_get_table_title(dry_run: bool) -> str:
@@ -411,22 +454,22 @@ def import_models(
     ctx: click.Context,
     yaml_file: str,
     dry_run: bool,
-    only_models_matching_regex: Optional[str],
-    only_access_groups_matching_regex: Optional[str],
+    only_models_matching_regex: str | None,
+    only_access_groups_matching_regex: str | None,
 ) -> None:
     """Import models from a YAML file and add them to the proxy."""
-    provider_counts: dict[str, int] = defaultdict(int)
-    added_models: list[ModelYamlInfo] = []
-    model_list = get_model_list_from_yaml_file(yaml_file)
-    filtered_model_list = _get_filtered_model_list(
+    provider_counts: Final[dict[str, int]] = defaultdict(int)
+    added_models: Final[list[ModelYamlInfo]] = []
+    model_list: Final = get_model_list_from_yaml_file(yaml_file)
+    filtered_model_list: Final = _get_filtered_model_list(
         model_list, only_models_matching_regex, only_access_groups_matching_regex
     )
 
     if not dry_run:
-        client = create_client(ctx)
+        client: Final = create_client(ctx)
 
-    for model in filtered_model_list:
-        model_info_obj = _get_model_info_obj_from_yaml(model)
+    for model, model_id in filtered_model_list:
+        model_info_obj = _get_model_info_obj_from_yaml(model, model_id)
         if not dry_run:
             try:
                 client.models.new(
@@ -439,6 +482,6 @@ def import_models(
         added_models.append(model_info_obj)
         provider_counts[model_info_obj.provider] += 1
 
-    table_title = _import_models_get_table_title(dry_run)
+    table_title: Final = _import_models_get_table_title(dry_run)
     _print_models_table(added_models, table_title)
     _print_summary_table(provider_counts)

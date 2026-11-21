@@ -3,13 +3,57 @@ Response Polling Handler for Background Responses with Cache
 """
 
 import json
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Final
 
+from pydantic import TypeAdapter
+from redis.exceptions import ResponseError
+
+from litellm._internal_context import with_service_target
 from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid4
 from litellm.caching.redis_cache import RedisCache
+from litellm.proxy.litellm_pre_call_utils import sanitize_for_log
 from litellm.types.llms.openai import ResponsesAPIResponse, ResponsesAPIStatus
+
+if TYPE_CHECKING:
+    from litellm.router import Router
+
+_RESPONSE_POLLING_TARGET: Final = "response_polling"
+_JSON_OBJECT: Final = TypeAdapter(dict[str, object])
+_JSON_LIST: Final = TypeAdapter(list[object])
+_SCRIPT_REPLY: Final = TypeAdapter(int)
+_WRITTEN: Final = 1
+_CACHED_VALUE: Final = TypeAdapter(object)
+
+
+def _encoded_state(state: Mapping[str, object]) -> str:
+    return json.dumps(json.dumps({"status": state["status"], **state}))
+
+
+_CANCELLED_PREFIX: Final = _encoded_state({"status": "cancelled"}).removesuffix('}"')
+
+_WRITE_UNLESS_CANCELLED_SCRIPT: Final = """
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+if redis.call('GETRANGE', KEYS[1], 0, string.len(ARGV[3]) - 1) == ARGV[3] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+
+
+async def _stored_status_prefix(redis_cache: RedisCache, cache_key: str) -> str:
+    return await redis_cache.async_getrange(cache_key, 0, len(_CANCELLED_PREFIX) - 1)
+
+
+def _json_document(value: object) -> str | bytes | bytearray:
+    if isinstance(value, (str, bytes, bytearray)):
+        return value
+    raise TypeError(f"the JSON object must be str, bytes or bytearray, not {value.__class__.__name__}")
 
 
 class ResponsePollingHandler:
@@ -18,7 +62,7 @@ class ResponsePollingHandler:
     CACHE_KEY_PREFIX = "litellm:polling:response:"
     POLLING_ID_PREFIX = "litellm_poll_"  # Clear prefix to identify polling IDs
 
-    def __init__(self, redis_cache: Optional[RedisCache] = None, ttl: int = 3600):
+    def __init__(self, redis_cache: RedisCache | None = None, ttl: int = 3600):
         self.redis_cache = redis_cache
         self.ttl = ttl  # Time-to-live for cache entries (default: 1 hour)
 
@@ -37,10 +81,11 @@ class ResponsePollingHandler:
         """Get Redis cache key for a polling ID"""
         return f"{cls.CACHE_KEY_PREFIX}{polling_id}"
 
+    @with_service_target(_RESPONSE_POLLING_TARGET)
     async def create_initial_state(
         self,
         polling_id: str,
-        request_data: Dict[str, Any],
+        request_data: Mapping[str, object],
     ) -> ResponsesAPIResponse:
         """
         Create initial state in Redis for a polling request
@@ -55,20 +100,22 @@ class ResponsePollingHandler:
         Returns:
             ResponsesAPIResponse object following OpenAI spec
         """
-        created_timestamp = int(datetime.now(timezone.utc).timestamp())
+        created_timestamp: Final = int(datetime.now(timezone.utc).timestamp())
 
         # Create OpenAI-compliant response object
-        response = ResponsesAPIResponse(
-            id=polling_id,
-            object="response",
-            status="queued",  # OpenAI native status
-            created_at=created_timestamp,
-            output=[],
-            metadata=request_data.get("metadata", {}),
-            usage=None,
+        response: Final = ResponsesAPIResponse.model_validate(
+            {
+                "id": polling_id,
+                "object": "response",
+                "status": "queued",  # OpenAI native status
+                "created_at": created_timestamp,
+                "output": [],
+                "metadata": request_data.get("metadata", {}),
+                "usage": None,
+            }
         )
 
-        cache_key = self.get_cache_key(polling_id)
+        cache_key: Final = self.get_cache_key(polling_id)
 
         if self.redis_cache:
             # Store ResponsesAPIResponse directly in Redis
@@ -77,33 +124,35 @@ class ResponsePollingHandler:
                 value=response.model_dump_json(),  # Pydantic v2 method
                 ttl=self.ttl,
             )
-            verbose_proxy_logger.debug(f"Created initial polling state for {polling_id} with TTL={self.ttl}s")
+            verbose_proxy_logger.debug("Created initial polling state for %s with TTL=%ss", polling_id, self.ttl)
 
         return response
 
+    @with_service_target(_RESPONSE_POLLING_TARGET)
     async def update_state(
         self,
         polling_id: str,
-        status: Optional[ResponsesAPIStatus] = None,
-        usage: Optional[Dict] = None,
-        error: Optional[Dict] = None,
-        incomplete_details: Optional[Dict] = None,
-        reasoning: Optional[Dict] = None,
-        tool_choice: Optional[Any] = None,
-        tools: Optional[list] = None,
-        output: Optional[list] = None,
+        status: ResponsesAPIStatus | None = None,
+        usage: Mapping[str, object] | None = None,
+        error: Mapping[str, object] | None = None,
+        incomplete_details: Mapping[str, object] | None = None,
+        reasoning: Mapping[str, object] | None = None,
+        tool_choice: object | None = None,
+        tools: Sequence[object] | None = None,
+        output: Sequence[object] | None = None,
         # Additional ResponsesAPIResponse fields
-        model: Optional[str] = None,
-        instructions: Optional[str] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        max_output_tokens: Optional[int] = None,
-        previous_response_id: Optional[str] = None,
-        text: Optional[Dict] = None,
-        truncation: Optional[str] = None,
-        parallel_tool_calls: Optional[bool] = None,
-        user: Optional[str] = None,
-        store: Optional[bool] = None,
+        model: str | None = None,
+        instructions: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_output_tokens: int | None = None,
+        previous_response_id: str | None = None,
+        text: Mapping[str, object] | None = None,
+        truncation: str | None = None,
+        parallel_tool_calls: bool | None = None,
+        user: str | None = None,
+        store: bool | None = None,
+        timing: Mapping[str, float] | None = None,
     ) -> None:
         """
         Update the polling state in Redis
@@ -132,20 +181,21 @@ class ResponsePollingHandler:
             parallel_tool_calls: Whether parallel tool calls are enabled
             user: User identifier
             store: Whether to store the response
+            timing: Server execution timings in milliseconds
         """
         if not self.redis_cache:
             return
 
-        cache_key = self.get_cache_key(polling_id)
+        cache_key: Final = self.get_cache_key(polling_id)
 
         # Get current state
-        cached_state = await self.redis_cache.async_get_cache(cache_key)
+        cached_state: Final = _CACHED_VALUE.validate_python(await self.redis_cache.async_get_cache(cache_key))
         if not cached_state:
-            verbose_proxy_logger.warning(f"No cached state found for polling_id: {polling_id}")
+            verbose_proxy_logger.warning("No cached state found for polling_id: %s", sanitize_for_log(polling_id))
             return
 
         # Parse existing ResponsesAPIResponse from cache
-        state = json.loads(cached_state)
+        state: Final = _JSON_OBJECT.validate_python(json.loads(_json_document(cached_state)))
 
         # Update status (using OpenAI native status values)
         if status:
@@ -154,6 +204,9 @@ class ResponsePollingHandler:
         # Replace full output list if provided
         if output is not None:
             state["output"] = output
+
+        if timing is not None:
+            state["litellm_response_timing"] = timing
 
         # Update usage
         if usage:
@@ -200,30 +253,77 @@ class ResponsePollingHandler:
         if store is not None:
             state["store"] = store
 
-        # Update cache with configured TTL
-        await self.redis_cache.async_set_cache(
-            key=cache_key,
-            value=json.dumps(state),
-            ttl=self.ttl,
-        )
+        try:
+            written: Final = await self._write_unless_cancelled(self.redis_cache, cache_key, state)
+        except Exception as write_error:  # noqa: BLE001  # a Redis fault must not end the background stream
+            verbose_proxy_logger.error(
+                "Failed to write the polling state for %s: %s",
+                sanitize_for_log(polling_id),
+                type(write_error).__name__,
+            )
+            return
+        if written != _WRITTEN:
+            verbose_proxy_logger.debug(
+                "Skipped the polling state write for %s: the response was cancelled or has expired",
+                sanitize_for_log(polling_id),
+            )
+            return
 
-        output_count = len(state.get("output", []))
+        output_count: Final = len(_JSON_LIST.validate_python(state.get("output", [])))
         verbose_proxy_logger.debug(
-            f"Updated polling state for {polling_id}: status={state['status']}, output_items={output_count}"
+            "Updated polling state for %s: status=%s, output_items=%s", polling_id, state["status"], output_count
         )
 
-    async def get_state(self, polling_id: str) -> Optional[Dict[str, Any]]:
+    @with_service_target(_RESPONSE_POLLING_TARGET)
+    async def get_state(self, polling_id: str) -> Mapping[str, object] | None:
         """Get current polling state from Redis"""
         if not self.redis_cache:
             return None
 
-        cache_key = self.get_cache_key(polling_id)
-        cached_state = await self.redis_cache.async_get_cache(cache_key)
+        cache_key: Final = self.get_cache_key(polling_id)
+        cached_state: Final = _CACHED_VALUE.validate_python(await self.redis_cache.async_get_cache(cache_key))
 
         if cached_state:
-            return json.loads(cached_state)
+            return _JSON_OBJECT.validate_python(json.loads(_json_document(cached_state)))
 
         return None
+
+    async def _write_unless_cancelled(
+        self, redis_cache: RedisCache, cache_key: str, state: Mapping[str, object]
+    ) -> int:
+        write_unless_cancelled: Final = redis_cache.async_register_script(_WRITE_UNLESS_CANCELLED_SCRIPT)
+        try:
+            return _SCRIPT_REPLY.validate_python(
+                await write_unless_cancelled(
+                    keys=(cache_key,),
+                    args=(_encoded_state(state), redis_cache.get_ttl(ttl=self.ttl), _CANCELLED_PREFIX),
+                )
+            )
+        except ResponseError as script_error:
+            verbose_proxy_logger.debug(
+                "Redis did not run the polling write script, writing with GETRANGE and SET XX GET: %s", script_error
+            )
+        if await _stored_status_prefix(redis_cache, cache_key) in ("", _CANCELLED_PREFIX):
+            return 0
+        return await self._replace_and_restore_a_cancel(redis_cache, cache_key, state)
+
+    async def _replace_and_restore_a_cancel(
+        self, redis_cache: RedisCache, cache_key: str, state: Mapping[str, object]
+    ) -> int:
+        ttl: Final = redis_cache.get_ttl(ttl=self.ttl)
+        previous: Final = await redis_cache.async_set_existing_returning_previous(cache_key, _encoded_state(state), ttl)
+        if previous is None:
+            return 0
+        if not previous.startswith(_CANCELLED_PREFIX):
+            return _WRITTEN
+        await redis_cache.async_set_existing_returning_previous(cache_key, previous, ttl)
+        return 0
+
+    @with_service_target(_RESPONSE_POLLING_TARGET)
+    async def is_cancelled_or_gone(self, polling_id: str) -> bool:
+        if not self.redis_cache:
+            return False
+        return await _stored_status_prefix(self.redis_cache, self.get_cache_key(polling_id)) in ("", _CANCELLED_PREFIX)
 
     async def cancel_polling(self, polling_id: str) -> bool:
         """
@@ -237,12 +337,13 @@ class ResponsePollingHandler:
         )
         return True
 
+    @with_service_target(_RESPONSE_POLLING_TARGET)
     async def delete_polling(self, polling_id: str) -> bool:
         """Delete a polling request from cache"""
         if not self.redis_cache:
             return False
 
-        cache_key = self.get_cache_key(polling_id)
+        cache_key: Final = self.get_cache_key(polling_id)
         # Use RedisCache's async_delete_cache method which handles Redis/RedisCluster
         await self.redis_cache.async_delete_cache(cache_key)
         return True
@@ -250,11 +351,11 @@ class ResponsePollingHandler:
 
 def should_use_polling_for_request(
     background_mode: bool,
-    polling_via_cache_enabled,  # Can be False, "all", or List[str]
-    redis_cache,  # RedisCache or None
+    polling_via_cache_enabled: bool | str | Sequence[str],
+    redis_cache: RedisCache | None,
     model: str,
-    llm_router,  # Router instance or None
-    native_background_mode: Optional[List[str]] = None,  # List of models that should use native background mode
+    llm_router: "Router | None",
+    native_background_mode: Sequence[str] | None = None,  # List of models that should use native background mode
 ) -> bool:
     """
     Determine if polling via cache should be used for a request.
@@ -277,7 +378,7 @@ def should_use_polling_for_request(
 
     # Check if model is in native_background_mode list - these use native provider background mode
     if native_background_mode and model in native_background_mode:
-        verbose_proxy_logger.debug(f"Model {model} is in native_background_mode list, skipping polling via cache")
+        verbose_proxy_logger.debug("Model %s is in native_background_mode list, skipping polling via cache", model)
         return False
 
     # "all" enables polling for all providers
@@ -288,16 +389,13 @@ def should_use_polling_for_request(
     if isinstance(polling_via_cache_enabled, list):
         # First, try to get provider from model string format "provider/model"
         if "/" in model:
-            provider = model.split("/")[0]
+            provider: Final = model.split("/")[0]
             if provider in polling_via_cache_enabled:
                 return True
         # Otherwise, check ALL deployments for this model_name in router
         elif llm_router is not None:
             try:
-                # Get all deployment indices for this model name
-                indices = llm_router.model_name_to_deployment_indices.get(model, [])
-                for idx in indices:
-                    deployment_dict = llm_router.model_list[idx]
+                for deployment_dict in llm_router.registry().deployments(model, source="named") or ():
                     litellm_params = deployment_dict.get("litellm_params", {})
 
                     # Check custom_llm_provider first
@@ -311,9 +409,9 @@ def should_use_polling_for_request(
 
                     # If ANY deployment's provider matches, enable polling
                     if dep_provider and dep_provider in polling_via_cache_enabled:
-                        verbose_proxy_logger.debug(f"Polling enabled for model={model}, provider={dep_provider}")
+                        verbose_proxy_logger.debug("Polling enabled for model=%s, provider=%s", model, dep_provider)
                         return True
             except Exception as e:
-                verbose_proxy_logger.debug(f"Could not resolve provider for model {model}: {e}")
+                verbose_proxy_logger.debug("Could not resolve provider for model %s: %s", model, e)
 
     return False

@@ -2,16 +2,22 @@
 Utility functions for the Agents API SDK.
 """
 
-from typing import Dict, Mapping, Optional
+from collections.abc import Iterable, Mapping
+from typing import Final, Protocol
 
+from litellm.litellm_core_utils.core_helpers import iter_items, require_attributes
 from litellm.llms.base_llm.agents.transformation import BaseAgentsAPIConfig
+
+
+class _SupportsItems(Protocol):
+    def items(self) -> Iterable[tuple[object, object]]: ...
 
 
 def merge_agent_headers(
     *,
-    dynamic_headers: Optional[Mapping[str, str]] = None,
-    static_headers: Optional[Mapping[str, str]] = None,
-) -> Optional[Dict[str, str]]:
+    dynamic_headers: Mapping[str, str] | None = None,
+    static_headers: object = None,
+) -> dict[str, str] | None:
     """Merge outbound HTTP headers for A2A agent calls.
 
     Merge rules:
@@ -23,22 +29,22 @@ def merge_agent_headers(
 
     If both contain the same header (case-insensitively), ``static_headers`` wins.
     """
-    merged: Dict[str, str] = {}
+    merged: dict[str, str] = {}
 
     if dynamic_headers:
         merged.update({str(k): str(v) for k, v in dynamic_headers.items()})
 
     if static_headers:
-        static_lower = {str(k).lower() for k in static_headers}
+        static_lower: Final = {str(k).lower() for k in iter_items(static_headers)}
         merged = {k: v for k, v in merged.items() if k.lower() not in static_lower}
-        merged.update({str(k): str(v) for k, v in static_headers.items()})
+        merged.update({str(k): str(v) for k, v in require_attributes(static_headers, _SupportsItems, "items").items()})
 
     return merged or None
 
 
 def get_provider_agents_api_config(
-    custom_llm_provider: Optional[str],
-) -> Optional[BaseAgentsAPIConfig]:
+    custom_llm_provider: str | None,
+) -> BaseAgentsAPIConfig | None:
     """
     Return a provider-specific BaseAgentsAPIConfig if the provider has a
     native agent-creation API, or None otherwise.

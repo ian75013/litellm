@@ -23,22 +23,25 @@ model, spend > 0), correlated by the x-litellm-call-id header.
 """
 
 import os
+import time
+from typing import Final
 
 import pytest
 from pydantic import BaseModel
 
-from e2e_config import unique_marker
+from e2e_config import settle_propagation, unique_marker
 from e2e_http import NoBody, require_successful_call, unwrap
+from e2e_metadata import Domain, Mode, Provider, Route, Subject, meta
 from lifecycle import ResourceManager
 from models import SpendLogRow
 from passthrough_client import PassthroughClient
 
 pytestmark = pytest.mark.e2e
 
-VERTEX_MODEL = "gemini-2.5-flash"
+VERTEX_MODEL = "gemini-3.8-flash"
 # The added deployment's region and the passthrough URL's region are the same constant,
 # so they always agree; the proxy registers passthrough credentials per project+region.
-VERTEX_LOCATION = os.environ.get("VERTEXAI_LOCATION", "us-central1")
+VERTEX_LOCATION: Final = "global"
 
 
 @pytest.fixture(scope="session")
@@ -90,7 +93,14 @@ class _ModelDeleteBody(BaseModel):
 def _add_vertex_passthrough_model(
     client: PassthroughClient, model_name: str, project: str, credentials: str
 ) -> str:
-    return unwrap(
+    """Register the passthrough deployment and settle before the caller uses it.
+
+    This body carries `use_in_pass_through` and a pinned `model_info.id`, so it
+    cannot go through ProxyClient.create_model -- but it needs that helper's
+    propagation settle just the same, or the passthrough call can land on a replica
+    that has not reloaded yet.
+    """
+    model_id = unwrap(
         client.proxy.transport.post(
             "/model/new",
             headers=client.proxy.transport.master,
@@ -108,6 +118,8 @@ def _add_vertex_passthrough_model(
             response_type=_ModelNewResponse,
         )
     ).model_id
+    settle_propagation(time.monotonic())
+    return model_id
 
 
 def _delete_model(client: PassthroughClient, model_id: str) -> None:
@@ -139,6 +151,15 @@ def _costed_row(client: PassthroughClient, call_id: str | None) -> SpendLogRow:
 
 
 class TestVertexPassthroughSpendTracking:
+    @meta(
+        Subject(
+            domain=Domain.SPEND_BUDGETS,
+            route=Route.PASSTHROUGH,
+            providers=(Provider.VERTEX_AI,),
+            models=(VERTEX_MODEL,),
+            mode=Mode.NONSTREAM,
+        )
+    )
     def test_vertex_passthrough_via_managed_model_logs_cost(
         self,
         client: PassthroughClient,

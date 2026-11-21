@@ -1,11 +1,15 @@
+from collections.abc import Iterable
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, List, Optional, Type, Union
+from typing import TYPE_CHECKING, Final, Protocol
 
 from fastapi import HTTPException
+from pydantic import TypeAdapter
+from typing_extensions import ReadOnly, TypedDict
 
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.custom_guardrail import CustomGuardrail
+from litellm.litellm_core_utils.core_helpers import iter_items, json_contains, require_attributes, set_item
 from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
     httpxSpecialProvider,
@@ -16,35 +20,48 @@ from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.proxy.guardrails.guardrail_hooks.javelin import (
     JavelinGuardInput,
     JavelinGuardRequest,
-    JavelinGuardResponse,
 )
 from litellm.types.utils import CallTypesLiteral, GuardrailStatus
 
 if TYPE_CHECKING:
     from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 
+_DECODED_JSON: Final = TypeAdapter(object)
+
+
+class _JavelinVerdict(TypedDict):
+    assessments: ReadOnly[object]
+
+
+class _JsonLookup(Protocol):
+    def get(self, key: str, default: object = ..., /) -> object: ...
+
+
+class _JsonPairs(Protocol):
+    def items(self) -> Iterable[tuple[object, object]]: ...
+
 
 class JavelinGuardrail(CustomGuardrail):
     @classmethod
-    def get_supported_event_hooks(cls) -> List[GuardrailEventHooks]:
+    def get_supported_event_hooks(cls) -> list[GuardrailEventHooks]:
         return [
             GuardrailEventHooks.pre_call,
         ]
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        api_base: Optional[str] = None,
+        api_key: str | None = None,
+        api_base: str | None = None,
         default_on: bool = True,
         guardrail_name: str = "trustsafety",
-        javelin_guard_name: Optional[str] = None,
+        javelin_guard_name: str | None = None,
         api_version: str = "v1",
-        metadata: Optional[Dict] = None,
-        config: Optional[Dict] = None,
-        application: Optional[str] = None,
+        metadata: dict | None = None,
+        config: dict | None = None,
+        application: str | None = None,
         **kwargs,
     ):
-        f"""
+        """
         Initialize the JavelinGuardrail class.
 
         This calls: {api_base}/{api_version}/guardrail/{guardrail_name}/apply
@@ -85,40 +102,45 @@ class JavelinGuardrail(CustomGuardrail):
         self,
         request: JavelinGuardRequest,
         event_type: GuardrailEventHooks,
-    ) -> JavelinGuardResponse:
+    ) -> _JavelinVerdict:
         """
         Call the Javelin guard API.
         """
-        start_time = datetime.now()
+        start_time: Final = datetime.now()
         # Create a new request with metadata if it's not already set
         if request.get("metadata") is None and self.metadata is not None:
             request = {**request, "metadata": self.metadata}
-        headers = {
+        headers: Final = {
             "x-javelin-apikey": self.javelin_api_key,
         }
         if self.application:
             headers["x-javelin-application"] = self.application
 
         status: GuardrailStatus = "guardrail_failed_to_respond"
-        javelin_response: Optional[JavelinGuardResponse] = None
+        javelin_response: _JavelinVerdict | None = None
         exception_str = ""
 
         try:
             verbose_proxy_logger.debug("Javelin Guardrail: Calling Javelin guard API with request: %s", request)
-            url = f"{self.api_base}/{self.api_version}/guardrail/{self.javelin_guard_name}/apply"
+            url: Final = f"{self.api_base}/{self.api_version}/guardrail/{self.javelin_guard_name}/apply"
             verbose_proxy_logger.debug("Javelin Guardrail: Calling URL: %s", url)
-            response = await self.async_handler.post(
+            response: Final = await self.async_handler.post(
                 url=url,
                 headers=headers,
                 json=dict(request),
+                timeout=self.timeout,
             )
-            verbose_proxy_logger.debug("Javelin Guardrail: Javelin guard API response: %s", response.json())
-            response_data = response.json()
+            verbose_proxy_logger.debug(
+                "Javelin Guardrail: Javelin guard API response: %s", _DECODED_JSON.validate_python(response.json())
+            )
+            response_data: Final = _DECODED_JSON.validate_python(response.json())
             # Ensure the response has the required assessments field
-            if "assessments" not in response_data:
-                response_data["assessments"] = []
+            if not json_contains(response_data, "assessments"):
+                set_item(response_data, "assessments", [])
 
-            javelin_response = {"assessments": response_data.get("assessments", [])}
+            javelin_response = {
+                "assessments": require_attributes(response_data, _JsonLookup, "get").get("assessments", [])
+            }
             status = "success"
             return javelin_response
         except Exception as e:
@@ -129,14 +151,14 @@ class JavelinGuardrail(CustomGuardrail):
             ####################################################
             # Create Guardrail Trace for logging on Langfuse, Datadog, etc.
             ####################################################
-            guardrail_json_response: Union[Exception, str, dict, List[dict]] = {}
+            guardrail_json_response: Exception | str | dict | list[dict] = {}
             if status == "success" and javelin_response is not None:
                 guardrail_json_response = dict(javelin_response)
             else:
                 guardrail_json_response = exception_str
 
             # Create a clean request data copy for logging (without guardrail responses)
-            clean_request_data = {
+            clean_request_data: Final = {
                 "input": request.get("input", {}),
                 "metadata": request.get("metadata", {}),
                 "config": request.get("config", {}),
@@ -163,9 +185,9 @@ class JavelinGuardrail(CustomGuardrail):
         self,
         user_api_key_dict: UserAPIKeyAuth,
         cache: litellm.DualCache,
-        data: Dict,
+        data: dict,
         call_type: CallTypesLiteral,
-    ) -> Optional[Union[Exception, str, Dict]]:
+    ) -> Exception | str | dict | None:
         """
         Pre-call hook for the Javelin guardrail.
         """
@@ -179,7 +201,7 @@ class JavelinGuardrail(CustomGuardrail):
         verbose_proxy_logger.debug("Javelin Guardrail: pre_call_hook")
         verbose_proxy_logger.debug("Javelin Guardrail: Request data: %s", data)
 
-        event_type: GuardrailEventHooks = GuardrailEventHooks.pre_call
+        event_type: Final[GuardrailEventHooks] = GuardrailEventHooks.pre_call
         if self.should_run_guardrail(data=data, event_type=event_type) is not True:
             verbose_proxy_logger.debug("Javelin Guardrail: not running guardrail. Guardrail is disabled.")
             return data
@@ -187,7 +209,7 @@ class JavelinGuardrail(CustomGuardrail):
         if "messages" not in data:
             return data
 
-        text = get_last_user_message(data["messages"])
+        text: Final = get_last_user_message(data["messages"])
         if text is None:
             return data
 
@@ -195,33 +217,33 @@ class JavelinGuardrail(CustomGuardrail):
         if self.metadata:
             clean_metadata = {k: v for k, v in self.metadata.items() if k != "standard_logging_guardrail_information"}
 
-        javelin_guard_request = JavelinGuardRequest(
+        javelin_guard_request: Final = JavelinGuardRequest(
             input=JavelinGuardInput(text=text),
             metadata=clean_metadata,
             config=self.config if self.config else {},
         )
 
-        javelin_response = await self.call_javelin_guard(
+        javelin_response: Final = await self.call_javelin_guard(
             request=javelin_guard_request, event_type=GuardrailEventHooks.pre_call
         )
 
-        assessments = javelin_response.get("assessments", [])
+        assessments: Final = javelin_response.get("assessments", [])
         reject_prompt = ""
         should_reject = False
 
         # Debug: Log the full Javelin response
         verbose_proxy_logger.debug("Javelin Guardrail: Full Javelin response: %s", javelin_response)
 
-        for assessment in assessments:
+        for assessment in iter_items(assessments):
             verbose_proxy_logger.debug("Javelin Guardrail: Processing assessment: %s", assessment)
-            for assessment_type, assessment_data in assessment.items():
+            for assessment_type, assessment_data in require_attributes(assessment, _JsonPairs, "items").items():
                 verbose_proxy_logger.debug(
                     "Javelin Guardrail: Processing assessment_type: %s, data: %s",
                     assessment_type,
                     assessment_data,
                 )
                 # Check if this assessment indicates rejection
-                if assessment_data.get("request_reject") is True:
+                if require_attributes(assessment_data, _JsonLookup, "get").get("request_reject") is True:
                     should_reject = True
                     verbose_proxy_logger.debug(
                         "Javelin Guardrail: Request rejected by Javelin guardrail: %s (assessment_type: %s)",
@@ -229,8 +251,8 @@ class JavelinGuardrail(CustomGuardrail):
                         assessment_type,
                     )
 
-                    results = assessment_data.get("results", {})
-                    reject_prompt = str(results.get("reject_prompt", ""))
+                    results = require_attributes(assessment_data, _JsonLookup, "get").get("results", {})
+                    reject_prompt = str(require_attributes(results, _JsonLookup, "get").get("reject_prompt", ""))
 
                     verbose_proxy_logger.debug(
                         "Javelin Guardrail: Extracted reject_prompt: '%s'",
@@ -270,7 +292,7 @@ class JavelinGuardrail(CustomGuardrail):
         return data
 
     @staticmethod
-    def get_config_model() -> Optional[Type["GuardrailConfigModel"]]:
+    def get_config_model() -> type["GuardrailConfigModel"] | None:
         """
         Get the config model for the Javelin guardrail.
         """

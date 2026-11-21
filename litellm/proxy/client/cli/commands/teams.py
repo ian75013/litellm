@@ -1,30 +1,43 @@
 """Team management commands for LiteLLM CLI."""
 
-from typing import Any, Dict, List, Optional
+from collections.abc import Mapping, Sequence
+from typing import Final
 
 import click
 import requests
 from rich.console import Console
 from rich.table import Table
+from typing_extensions import ReadOnly, TypedDict
 
+from litellm.litellm_core_utils.core_helpers import iter_items, require_get
 from litellm.proxy.client import Client
+
+from ._cli_context import cli_context_values
+from .auth import models_summary
+
+
+class _TeamModelsView(TypedDict):
+    models: ReadOnly[Sequence[str]]
+
+
+class _ErrorBodyView(TypedDict):
+    body: ReadOnly[Mapping[str, object]]
 
 
 @click.group()
 def teams():
     """Manage teams and team assignments"""
-    pass
 
 
-def display_teams_table(teams: List[Dict[str, Any]]) -> None:
+def display_teams_table(teams: object) -> None:
     """Display teams in a formatted table"""
-    console = Console()
+    console: Final = Console()
 
     if not teams:
         console.print("No teams found for your user.")
         return
 
-    table = Table(title="Available Teams")
+    table: Final = Table(title="Available Teams")
     table.add_column("Index", style="cyan", no_wrap=True)
     table.add_column("Team Alias", style="magenta")
     table.add_column("Team ID", style="green")
@@ -32,20 +45,14 @@ def display_teams_table(teams: List[Dict[str, Any]]) -> None:
     table.add_column("Max Budget", style="blue")
     table.add_column("Role", style="red")
 
-    for i, team in enumerate(teams):
+    for i, entry in enumerate(iter_items(teams)):
+        team = require_get(entry)
         team_alias = team.get("team_alias") or "N/A"
         team_id = team.get("team_id", "N/A")
         models = team.get("models", [])
         max_budget = team.get("max_budget")
 
-        # Format models list
-        if models:
-            if len(models) > 3:
-                models_str = ", ".join(models[:3]) + f" (+{len(models) - 3} more)"
-            else:
-                models_str = ", ".join(models)
-        else:
-            models_str = "All models"
+        models_str = models_summary(models)
 
         # Format budget
         budget_str = f"${max_budget}" if max_budget else "Unlimited"
@@ -65,19 +72,20 @@ def display_teams_table(teams: List[Dict[str, Any]]) -> None:
 @click.pass_context
 def list(ctx: click.Context):
     """List teams that you belong to"""
-    client = Client(ctx.obj["base_url"], ctx.obj["api_key"])
+    context: Final = cli_context_values(ctx)
+    client: Final = Client(context["base_url"], context["api_key"])
 
     try:
         # Use list() for simpler response structure (returns array directly)
-        teams = client.teams.list()
+        teams: Final = client.teams.list()
         display_teams_table(teams)
     except requests.exceptions.HTTPError as e:
         click.echo(f"Error: HTTP {e.response.status_code}", err=True)
-        error_body = e.response.json()
-        click.echo(f"Details: {error_body.get('detail', 'Unknown error')}", err=True)
+        error_body: Final[_ErrorBodyView] = {"body": e.response.json()}
+        click.echo(f"Details: {error_body['body'].get('detail', 'Unknown error')}", err=True)
         raise click.Abort()
     except Exception as e:
-        click.echo(f"Error: {str(e)}", err=True)
+        click.echo(f"Error: {e}", err=True)
         raise click.Abort()
 
 
@@ -85,32 +93,34 @@ def list(ctx: click.Context):
 @click.pass_context
 def available(ctx: click.Context):
     """List teams that are available to join"""
-    client = Client(ctx.obj["base_url"], ctx.obj["api_key"])
+    context: Final = cli_context_values(ctx)
+    client: Final = Client(context["base_url"], context["api_key"])
 
     try:
-        teams = client.teams.get_available()
+        teams: Final = client.teams.get_available()
         if teams:
-            console = Console()
+            console: Final = Console()
             console.print("\nAvailable Teams to Join:")
             display_teams_table(teams)
         else:
             click.echo("No available teams to join.")
     except requests.exceptions.HTTPError as e:
         click.echo(f"Error: HTTP {e.response.status_code}", err=True)
-        error_body = e.response.json()
-        click.echo(f"Details: {error_body.get('detail', 'Unknown error')}", err=True)
+        error_body: Final[_ErrorBodyView] = {"body": e.response.json()}
+        click.echo(f"Details: {error_body['body'].get('detail', 'Unknown error')}", err=True)
     except Exception as e:
-        click.echo(f"Error: {str(e)}", err=True)
+        click.echo(f"Error: {e}", err=True)
         raise click.Abort()
 
 
 @teams.command()
 @click.option("--team-id", type=str, help="Team ID to assign the key to")
 @click.pass_context
-def assign_key(ctx: click.Context, team_id: Optional[str]):
+def assign_key(ctx: click.Context, team_id: str | None):
     """Assign your current CLI key to a team"""
-    client = Client(ctx.obj["base_url"], ctx.obj["api_key"])
-    api_key = ctx.obj["api_key"]
+    context: Final = cli_context_values(ctx)
+    client: Final = Client(context["base_url"], context["api_key"])
+    api_key: Final = context["api_key"]
 
     if not api_key:
         click.echo("No API key found. Please login first using 'litellm login'")
@@ -128,7 +138,7 @@ def assign_key(ctx: click.Context, team_id: Optional[str]):
             # Use interactive selection from auth module
             from .auth import prompt_team_selection
 
-            selected_team = prompt_team_selection(teams)
+            selected_team: Final = prompt_team_selection(teams)
 
             if selected_team:
                 team_id = selected_team.get("team_id")
@@ -146,18 +156,18 @@ def assign_key(ctx: click.Context, team_id: Optional[str]):
             teams = client.teams.list()
             for team in teams:
                 if team.get("team_id") == team_id:
-                    models = team.get("models", [])
-                    if models:
-                        click.echo(f"You can now access models: {', '.join(models)}")
+                    team_models: _TeamModelsView = {"models": team.get("models", [])}
+                    if team_models["models"]:
+                        click.echo(f"You can now access models: {', '.join(team_models['models'])}")
                     else:
                         click.echo("You can now access all available models")
                     break
 
     except requests.exceptions.HTTPError as e:
         click.echo(f"Error: HTTP {e.response.status_code}", err=True)
-        error_body = e.response.json()
-        click.echo(f"Details: {error_body.get('detail', 'Unknown error')}", err=True)
+        error_body: Final[_ErrorBodyView] = {"body": e.response.json()}
+        click.echo(f"Details: {error_body['body'].get('detail', 'Unknown error')}", err=True)
         raise click.Abort()
     except Exception as e:
-        click.echo(f"Error: {str(e)}", err=True)
+        click.echo(f"Error: {e}", err=True)
         raise click.Abort()

@@ -10,23 +10,38 @@ be of type Object`.
 Reference: https://docs.cohere.com/v2/reference/embed
 """
 
-from typing import TYPE_CHECKING, Any, List, Optional, Union, cast
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Final, cast
 
 if TYPE_CHECKING:
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.types.llms.openai import AllEmbeddingInputValues
 
 from httpx._models import Headers, Response
+from pydantic import TypeAdapter
 
 import litellm
+from litellm.litellm_core_utils.core_helpers import as_str_mapping, require_attributes, subscript
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.base_llm.embedding.transformation import BaseEmbeddingConfig
 from litellm.llms.bedrock.embed.cohere_transformation import (
     BedrockCohereEmbeddingConfig,
 )
 from litellm.llms.cohere.embed.v1_transformation import CohereEmbeddingConfig
+from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import EmbeddingResponse
 
 from ..common_utils import SagemakerError
+
+_DECODED_JSON: Final = TypeAdapter(object)
+
+
+def _cohere_embed_body(response_json: object) -> dict[str, object]:
+    body: Final = as_str_mapping(response_json)
+    if isinstance(body, dict):
+        return body
+    subscript(response_json, "embeddings")
+    return require_attributes(response_json, dict[str, object], "get")
 
 
 class SagemakerCohereEmbeddingConfig(BaseEmbeddingConfig):
@@ -37,7 +52,7 @@ class SagemakerCohereEmbeddingConfig(BaseEmbeddingConfig):
     def __init__(self) -> None:
         pass
 
-    def get_supported_openai_params(self, model: str) -> List[str]:
+    def get_supported_openai_params(self, model: str) -> list[str]:
         return ["encoding_format", "dimensions", "input_type"]
 
     def map_openai_params(
@@ -55,7 +70,7 @@ class SagemakerCohereEmbeddingConfig(BaseEmbeddingConfig):
             optional_params["input_type"] = non_default_params["input_type"]
         return optional_params
 
-    def get_error_class(self, error_message: str, status_code: int, headers: Union[dict, Headers]) -> BaseLLMException:
+    def get_error_class(self, error_message: str, status_code: int, headers: dict | Headers) -> BaseLLMException:
         return SagemakerError(message=error_message, status_code=status_code, headers=headers)
 
     def transform_embedding_request(
@@ -69,16 +84,16 @@ class SagemakerCohereEmbeddingConfig(BaseEmbeddingConfig):
         Transform embedding request for Cohere models on SageMaker
         """
         if isinstance(input, str):
-            input_list: List[str] = [input]
+            input_list: list[str] = [input]
         elif isinstance(input, list):
             if input and (isinstance(input[0], list) or isinstance(input[0], int)):
                 raise ValueError("Input must be a list of strings")
-            input_list = cast(List[str], input)
+            input_list = cast(list[str], input)
         else:
             input_list = [str(input)]
 
         return dict(
-            BedrockCohereEmbeddingConfig()._transform_request(
+            BedrockCohereEmbeddingConfig().transform_request(
                 model=model,
                 input=input_list,
                 inference_params=optional_params,
@@ -90,8 +105,8 @@ class SagemakerCohereEmbeddingConfig(BaseEmbeddingConfig):
         model: str,
         raw_response: Response,
         model_response: "EmbeddingResponse",
-        logging_obj: Any,
-        api_key: Optional[str] = None,
+        logging_obj: "LiteLLMLoggingObj",
+        api_key: str | None = None,
         request_data: dict = {},
         optional_params: dict = {},
         litellm_params: dict = {},
@@ -110,23 +125,24 @@ class SagemakerCohereEmbeddingConfig(BaseEmbeddingConfig):
         if isinstance(input_value, str):
             input_value = [input_value]
 
-        return CohereEmbeddingConfig()._populate_embedding_response(
-            response_json=raw_response.json(),
+        response_json: Final = _DECODED_JSON.validate_python(raw_response.json())
+        return CohereEmbeddingConfig().populate_embedding_response(
             model_response=model_response,
             model=model,
             encoding=litellm.encoding,
             input=input_value,
+            response_json=_cohere_embed_body(response_json),
         )
 
     def validate_environment(
         self,
         headers: dict,
         model: str,
-        messages: List[Any],
+        messages: Sequence[AllMessageValues],
         optional_params: dict,
         litellm_params: dict,
-        api_key: Optional[str] = None,
-        api_base: Optional[str] = None,
+        api_key: str | None = None,
+        api_base: str | None = None,
     ) -> dict:
         """
         Validate environment for SageMaker Cohere embeddings

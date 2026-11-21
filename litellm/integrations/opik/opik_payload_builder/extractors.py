@@ -1,12 +1,42 @@
 """Data extraction functions for Opik payload building."""
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from collections.abc import Mapping
+from typing import Final, Protocol
+
+from pydantic import TypeAdapter
 
 from litellm import _logging
+from litellm.litellm_core_utils.core_helpers import iter_items, require_attributes
+
+_DECODED_JSON: Final = TypeAdapter(object)
 
 
-def normalize_provider_name(provider: Optional[str]) -> Optional[str]:
+class _SupportsGet(Protocol):
+    def get(self, key: str, default: object = None, /) -> object: ...
+
+
+class _SupportsCopy(Protocol):
+    def copy(self) -> object: ...
+
+
+class _SupportsUpdate(Protocol):
+    def update(self, other: object, /) -> object: ...
+
+
+class _SpanIdentifiers(Protocol):
+    @property
+    def trace_id(self) -> str | None: ...
+
+    @property
+    def id(self) -> str | None: ...
+
+
+def _trace_and_span_ids(span: _SpanIdentifiers) -> tuple[str | None, str | None]:
+    return span.trace_id, span.id
+
+
+def normalize_provider_name(provider: str | None) -> str | None:
     """
     Normalize LiteLLM provider names to standardized string names.
 
@@ -20,7 +50,7 @@ def normalize_provider_name(provider: Optional[str]) -> Optional[str]:
         return None
 
     # Provider mapping to names used in Opik
-    provider_mapping = {
+    provider_mapping: Final = {
         "openai": "openai",
         "vertex_ai-language-models": "google_vertexai",
         "gemini": "google_ai",
@@ -35,9 +65,9 @@ def normalize_provider_name(provider: Optional[str]) -> Optional[str]:
 
 
 def extract_opik_metadata(
-    litellm_metadata: Dict[str, Any],
-    standard_logging_metadata: Dict[str, Any],
-) -> Dict[str, Any]:
+    litellm_metadata: object,
+    standard_logging_metadata: Mapping[str, object],
+) -> object:
     """
     Merge Opik metadata from three sources in increasing priority order:
 
@@ -53,27 +83,28 @@ def extract_opik_metadata(
         Merged Opik metadata dictionary.
     """
     # Start with auth-key defaults (lowest priority).
-    auth_meta = standard_logging_metadata.get("user_api_key_auth_metadata") or {}
-    opik_meta = (auth_meta.get("opik") or {}).copy()
+    auth_meta: Final[object] = standard_logging_metadata.get("user_api_key_auth_metadata") or {}
+    auth_opik: Final[object] = require_attributes(auth_meta, _SupportsGet, "get").get("opik") or {}
+    opik_meta: Final = require_attributes(auth_opik, _SupportsCopy, "copy").copy()
 
     # Request-level values override auth-key defaults.
-    request_opik = litellm_metadata.get("opik") or {}
-    opik_meta.update(request_opik)
+    request_opik: Final[object] = require_attributes(litellm_metadata, _SupportsGet, "get").get("opik") or {}
+    require_attributes(opik_meta, _SupportsUpdate, "update").update(request_opik)
 
     # Requester-level values win over everything else.
-    requester_metadata = standard_logging_metadata.get("requester_metadata", {}) or {}
-    requester_opik = requester_metadata.get("opik", {}) or {}
+    requester_metadata: Final[object] = standard_logging_metadata.get("requester_metadata", {}) or {}
+    requester_opik: Final[object] = require_attributes(requester_metadata, _SupportsGet, "get").get("opik", {}) or {}
     if requester_opik:
-        opik_meta.update(requester_opik)
+        require_attributes(opik_meta, _SupportsUpdate, "update").update(requester_opik)
 
-    _logging.verbose_logger.debug(f"litellm_opik_metadata - {json.dumps(opik_meta, default=str)}")
+    _logging.verbose_logger.debug("litellm_opik_metadata - %s", json.dumps(opik_meta, default=str))
 
     return opik_meta
 
 
 def extract_span_identifiers(
-    current_span_data: Any,
-) -> Tuple[Optional[str], Optional[str]]:
+    current_span_data: object,
+) -> tuple[str | None, str | None]:
     """
     Extract trace_id and parent_span_id from current_span_data.
 
@@ -90,16 +121,16 @@ def extract_span_identifiers(
         return (current_span_data.get("trace_id"), current_span_data.get("id"))
 
     try:
-        return current_span_data.trace_id, current_span_data.id
+        return _trace_and_span_ids(require_attributes(current_span_data, _SpanIdentifiers, "trace_id", "id"))
     except AttributeError:
-        _logging.verbose_logger.warning(f"Unexpected current_span_data format: {type(current_span_data)}")
+        _logging.verbose_logger.warning("Unexpected current_span_data format: %s", type(current_span_data))
         return None, None
 
 
 def extract_tags(
-    opik_metadata: Dict[str, Any],
-    custom_llm_provider: Optional[str],
-) -> List[str]:
+    opik_metadata: Mapping[str, object],
+    custom_llm_provider: str | None,
+) -> list[object]:
     """
     Extract and build list of tags.
 
@@ -110,7 +141,8 @@ def extract_tags(
     Returns:
         List of tags
     """
-    tags = list(opik_metadata.get("tags", []))
+    metadata_tags: Final[object] = opik_metadata.get("tags", [])
+    tags: Final = list(iter_items(metadata_tags))
 
     if custom_llm_provider:
         tags.append(custom_llm_provider)
@@ -119,11 +151,11 @@ def extract_tags(
 
 
 def apply_proxy_header_overrides(
-    project_name: str,
-    tags: List[str],
-    thread_id: Optional[str],
-    proxy_headers: Dict[str, Any],
-) -> Tuple[str, List[str], Optional[str]]:
+    project_name: object,
+    tags: list[object],
+    thread_id: object,
+    proxy_headers: Mapping[str, str],
+) -> tuple[object, list[object], object]:
     """
     Apply overrides from proxy request headers (opik_* prefix).
 
@@ -148,21 +180,21 @@ def apply_proxy_header_overrides(
             thread_id = value
         elif param_key == "tags":
             try:
-                parsed_tags = json.loads(value)
+                parsed_tags = _DECODED_JSON.validate_python(json.loads(value))
                 if isinstance(parsed_tags, list):
                     tags.extend(parsed_tags)
             except (json.JSONDecodeError, TypeError):
-                _logging.verbose_logger.warning(f"Failed to parse tags from header: {value}")
+                _logging.verbose_logger.warning("Failed to parse tags from header: %s", value)
 
     return project_name, tags, thread_id
 
 
 def extract_and_build_metadata(
-    opik_metadata: Dict[str, Any],
-    standard_logging_metadata: Dict[str, Any],
-    standard_logging_object: Dict[str, Any],
-    litellm_kwargs: Dict[str, Any],
-) -> Dict[str, Any]:
+    opik_metadata: Mapping[str, object],
+    standard_logging_metadata: Mapping[str, object],
+    standard_logging_object: Mapping[str, object],
+    litellm_kwargs: Mapping[str, object],
+) -> dict[str, object]:
     """
     Build the complete metadata dictionary from all available sources.
 
@@ -182,7 +214,7 @@ def extract_and_build_metadata(
         Complete metadata dictionary for trace/span
     """
     # Start with opik metadata (excluding current_span_data which is used for trace linking)
-    metadata = {k: v for k, v in opik_metadata.items() if k != "current_span_data"}
+    metadata: Final = {k: v for k, v in opik_metadata.items() if k != "current_span_data"}
     metadata["created_from"] = "litellm"
 
     # Merge with standard logging metadata
@@ -190,7 +222,7 @@ def extract_and_build_metadata(
 
     # Add fields from standard_logging_object
     # These come from the LiteLLM logging infrastructure
-    field_mappings = {
+    field_mappings: Final = {
         "call_type": "type",
         "status": "status",
         "model": "model",

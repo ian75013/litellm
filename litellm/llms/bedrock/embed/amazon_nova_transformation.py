@@ -12,7 +12,9 @@ Supports:
 Docs - https://docs.aws.amazon.com/bedrock/latest/userguide/nova-embed.html
 """
 
-from typing import List, Optional
+from collections.abc import Mapping, Sequence
+from itertools import zip_longest
+from typing import Final
 
 from litellm.types.utils import (
     Embedding,
@@ -20,6 +22,26 @@ from litellm.types.utils import (
     PromptTokensDetailsWrapper,
     Usage,
 )
+
+
+def _estimated_item_tokens(item: Mapping[str, object]) -> int:
+    truncated: Final = item.get("truncatedCharLength")
+    embedding: Final = item.get("embedding")
+    if isinstance(truncated, int):
+        return truncated // 4
+    return len(embedding) // 4 if isinstance(embedding, list) else 0
+
+
+def _estimated_input_tokens(response: Mapping[str, object]) -> int:
+    items: Final = response.get("embeddings")
+    if isinstance(items, list):
+        return sum(_estimated_item_tokens(item) for item in items if isinstance(item, Mapping) and "embedding" in item)
+    return _estimated_item_tokens({"embedding": response.get("embedding")})
+
+
+def _is_audio_or_video_request(request_data: Mapping[str, object]) -> bool:
+    params: Final = request_data.get("singleEmbeddingParams") or request_data.get("segmentedEmbeddingParams")
+    return isinstance(params, Mapping) and ("audio" in params or "video" in params)
 
 
 class AmazonNovaEmbeddingConfig:
@@ -35,7 +57,7 @@ class AmazonNovaEmbeddingConfig:
     def __init__(self) -> None:
         pass
 
-    def get_supported_openai_params(self) -> List[str]:
+    def get_supported_openai_params(self) -> list[str]:
         return [
             "dimensions",
         ]
@@ -88,8 +110,8 @@ class AmazonNovaEmbeddingConfig:
         input: str,
         inference_params: dict,
         async_invoke_route: bool = False,
-        model_id: Optional[str] = None,
-        output_s3_uri: Optional[str] = None,
+        model_id: str | None = None,
+        output_s3_uri: str | None = None,
     ) -> dict:
         """
         Transform OpenAI-style input to Nova format.
@@ -108,16 +130,16 @@ class AmazonNovaEmbeddingConfig:
             dict: Nova embedding request
         """
         # Determine task type
-        task_type = "SEGMENTED_EMBEDDING" if async_invoke_route else "SINGLE_EMBEDDING"
+        task_type: Final = "SEGMENTED_EMBEDDING" if async_invoke_route else "SINGLE_EMBEDDING"
 
         # Build the base request structure
-        request: dict = {
+        request: Final[dict] = {
             "schemaVersion": "nova-multimodal-embed-v1",
             "taskType": task_type,
         }
 
         # Start with inference_params (user-provided params)
-        embedding_params = inference_params.copy()
+        embedding_params: Final = inference_params.copy()
 
         embedding_params.pop("output_s3_uri", None)
 
@@ -160,14 +182,14 @@ class AmazonNovaEmbeddingConfig:
                     }
                 elif media_type.startswith("video/"):
                     # Handle video data URLs
-                    video_format = media_type.split("/")[1].lower()
+                    video_format: Final = media_type.split("/")[1].lower()
                     embedding_params["video"] = {
                         "format": video_format,
                         "source": {"bytes": base64_data},
                     }
                 elif media_type.startswith("audio/"):
                     # Handle audio data URLs
-                    audio_format = media_type.split("/")[1].lower()
+                    audio_format: Final = media_type.split("/")[1].lower()
                     embedding_params["audio"] = {
                         "format": audio_format,
                         "source": {"bytes": base64_data},
@@ -204,11 +226,21 @@ class AmazonNovaEmbeddingConfig:
 
         return request
 
+    def transform_request(
+        self,
+        input: str,
+        inference_params: dict[str, object],  # mutable-ok: mirrors override contract
+        async_invoke_route: bool = False,
+        model_id: str | None = None,
+        output_s3_uri: str | None = None,
+    ) -> dict[str, object]:  # mutable-ok: mirrors override contract
+        return self._transform_request(input, inference_params, async_invoke_route, model_id, output_s3_uri)
+
     def _wrap_async_invoke_request(
         self,
         model_input: dict,
         model_id: str,
-        output_s3_uri: Optional[str] = None,
+        output_s3_uri: str | None = None,
     ) -> dict:
         """
         Wrap the transformed request in the AWS Bedrock async invoke format.
@@ -240,9 +272,10 @@ class AmazonNovaEmbeddingConfig:
 
     def _transform_response(
         self,
-        response_list: List[dict],
+        response_list: list[dict],
         model: str,
-        batch_data: Optional[List[dict]] = None,
+        batch_data: Sequence[Mapping[str, object]] | None = None,
+        metered_input_tokens: Sequence[int | None] = (),
     ) -> EmbeddingResponse:
         """
         Transform Nova response to OpenAI format.
@@ -258,8 +291,7 @@ class AmazonNovaEmbeddingConfig:
             ]
         }
         """
-        embeddings: List[Embedding] = []
-        total_tokens = 0
+        embeddings: Final[list[Embedding]] = []
 
         for response in response_list:
             # Nova response has an "embeddings" array
@@ -272,14 +304,6 @@ class AmazonNovaEmbeddingConfig:
                             object="embedding",
                         )
                         embeddings.append(embedding)
-
-                        # Estimate token count
-                        # For text, use truncatedCharLength if available
-                        if "truncatedCharLength" in item:
-                            total_tokens += item["truncatedCharLength"] // 4
-                        else:
-                            # Rough estimate based on embedding dimension
-                            total_tokens += len(item["embedding"]) // 4
             elif "embedding" in response:
                 # Direct embedding response (fallback)
                 embedding = Embedding(
@@ -288,7 +312,6 @@ class AmazonNovaEmbeddingConfig:
                     object="embedding",
                 )
                 embeddings.append(embedding)
-                total_tokens += len(response["embedding"]) // 4
 
         # Count images from original requests for cost calculation
         image_count = 0
@@ -299,22 +322,39 @@ class AmazonNovaEmbeddingConfig:
                     "singleEmbeddingParams",
                     request_data.get("segmentedEmbeddingParams", {}),
                 )
-                if "image" in params:
+                if isinstance(params, Mapping) and "image" in params:
                     image_count += 1
 
-        prompt_tokens_details: Optional[PromptTokensDetailsWrapper] = None
+        prompt_tokens_details: PromptTokensDetailsWrapper | None = None
         if image_count > 0:
             prompt_tokens_details = PromptTokensDetailsWrapper(
                 image_count=image_count,
             )
 
-        usage = Usage(
-            prompt_tokens=total_tokens,
-            total_tokens=total_tokens,
+        text_and_image_metered: Final = tuple(
+            None if _is_audio_or_video_request(request_data) else metered
+            for request_data, metered in zip(batch_data or (), metered_input_tokens)
+        )
+        prompt_tokens: Final = sum(
+            _estimated_input_tokens(response) if metered is None else metered
+            for response, metered in zip_longest(response_list, text_and_image_metered)
+        )
+        usage: Final = Usage(
+            prompt_tokens=prompt_tokens,
+            total_tokens=prompt_tokens,
             prompt_tokens_details=prompt_tokens_details,
         )
 
         return EmbeddingResponse(data=embeddings, model=model, usage=usage)
+
+    def transform_response(
+        self,
+        response_list: list[dict[str, object]],  # mutable-ok: mirrors override contract
+        model: str,
+        batch_data: list[dict[str, object]] | None = None,  # mutable-ok: mirrors override contract
+        metered_input_tokens: Sequence[int | None] = (),
+    ) -> EmbeddingResponse:
+        return self._transform_response(response_list, model, batch_data, metered_input_tokens)
 
     def _transform_async_invoke_response(self, response: dict, model: str) -> EmbeddingResponse:
         """
@@ -327,22 +367,22 @@ class AmazonNovaEmbeddingConfig:
 
         We transform this to a job-like embedding response with the ARN in hidden params.
         """
-        invocation_arn = response.get("invocationArn", "")
+        invocation_arn: Final = response.get("invocationArn", "")
 
         # Create a placeholder embedding object for the job
-        embedding = Embedding(
+        embedding: Final = Embedding(
             embedding=[],  # Empty embedding for async jobs
             index=0,
             object="embedding",
         )
 
         # Create usage object (empty for async jobs)
-        usage = Usage(prompt_tokens=0, total_tokens=0)
+        usage: Final = Usage(prompt_tokens=0, total_tokens=0)
 
         # Create hidden params with job ID
         from litellm.types.llms.base import HiddenParams
 
-        hidden_params = HiddenParams()
+        hidden_params: Final = HiddenParams()
         setattr(hidden_params, "_invocation_arn", invocation_arn)
 
         return EmbeddingResponse(
@@ -351,3 +391,10 @@ class AmazonNovaEmbeddingConfig:
             usage=usage,
             hidden_params=hidden_params,
         )
+
+    def transform_async_invoke_response(
+        self,
+        response: dict[str, object],  # mutable-ok: mirrors override contract
+        model: str,
+    ) -> EmbeddingResponse:
+        return self._transform_async_invoke_response(response, model)
